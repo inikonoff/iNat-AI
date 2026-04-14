@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from config import TELEGRAM_BOT_TOKEN, PORT
 from bot.handlers import (
     cmd_start, cmd_help, cmd_stats, cmd_favorites, cmd_search,
-    handle_photo, handle_callback, handle_text,
+    handle_photo, handle_callback, handle_text, handle_unsupported,
 )
 
 logging.basicConfig(
@@ -52,6 +52,13 @@ def build_application() -> Application:
 
     # Photo
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Unsupported types — stickers, documents, voice, video, etc.
+    app.add_handler(MessageHandler(
+        filters.Sticker.ALL | filters.Document.ALL |
+        filters.VOICE | filters.VIDEO | filters.AUDIO,
+        handle_unsupported,
+    ))
 
     # Callback buttons (inline keyboard)
     app.add_handler(CallbackQueryHandler(handle_callback))

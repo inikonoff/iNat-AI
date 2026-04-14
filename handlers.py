@@ -19,6 +19,14 @@ from config import ADMIN_IDS, SCORE_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
+# Антифлуд: минимальный интервал между запросами от одного пользователя (секунды)
+FLOOD_INTERVAL = 10
+# Порог уверенности для показа альтернатив
+ALTERNATIVES_THRESHOLD = 0.70
+
+# Словарь для хранения времени последнего запроса: {user_id: timestamp}
+_last_request: dict[int, float] = {}
+
 
 # ── Helpers ───────────────────────────────────────────────────
 
@@ -52,6 +60,39 @@ def get_threshold() -> float:
         return SCORE_THRESHOLD
 
 
+def is_bot_active() -> bool:
+    return db.get_setting("bot_active", "true").lower() == "true"
+
+
+def check_flood(user_id: int) -> tuple[bool, int]:
+    """
+    Возвращает (разрешено, секунд_осталось).
+    Обновляет время последнего запроса если разрешено.
+    """
+    now = time.time()
+    last = _last_request.get(user_id, 0)
+    elapsed = now - last
+    if elapsed < FLOOD_INTERVAL:
+        remaining = int(FLOOD_INTERVAL - elapsed) + 1
+        return False, remaining
+    _last_request[user_id] = now
+    return True, 0
+
+
+def build_alternatives_text(inat_result: dict) -> str:
+    """Формирует строку с топ-3 альтернативами если уверенность ниже порога."""
+    alts = inat_result.get("all_results", [])[1:3]  # 2-й и 3-й результаты
+    if not alts:
+        return ""
+    lines = ["\n\n🔄 *Возможные альтернативы:*"]
+    for r in alts:
+        score_pct = int(r["score"] * 100)
+        name = r.get("common") or r.get("name") or "—"
+        latin = r.get("name", "")
+        lines.append(f"• {name} _({latin})_ — {score_pct}%")
+    return "\n".join(lines)
+
+
 # ── Commands ──────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -80,9 +121,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/favorites — моё избранное\n"
         "/stats — моя статистика\n\n"
         "*Как пользоваться:*\n"
-        "Отправь фото живого организма — насекомого, растения, гриба, птицы, паука — бот определит вид и расскажет о нём подробно.\n\n"
+        "Отправь фото живого организма — насекомого, растения, гриба, "
+        "птицы, паука — бот определит вид и расскажет о нём подробно.\n\n"
         "*Лимиты:*\n"
-        "До 20 запросов в сутки (сбрасывается в полночь UTC).\n\n"
+        "До 20 запросов в сутки (сбрасывается в полночь UTC).\n"
+        "Не чаще одного фото в 10 секунд.\n\n"
         "Если есть вопросы — свяжись с администратором."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -97,7 +140,14 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     used = db_user.get("requests_today", 0)
     limit = db_user.get("daily_limit", 20)
-    total = db.get_client().table("requests").select("id", count="exact").eq("telegram_id", user.id).execute().count or 0
+    total = (
+        db.get_client()
+        .table("requests")
+        .select("id", count="exact")
+        .eq("telegram_id", user.id)
+        .execute()
+        .count or 0
+    )
 
     await update.message.reply_text(
         f"📊 *Твоя статистика*\n\n"
@@ -113,12 +163,12 @@ async def cmd_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     favs = db.get_favorites(user.id)
     if not favs:
         await update.message.reply_text(
-            "⭐ У тебя пока нет избранных насекомых.\n"
-            "После определения вида нажми кнопку «В избранное»."
+            "⭐ У тебя пока нет избранных видов.\n"
+            "После определения нажми кнопку «В избранное»."
         )
         return
 
-    lines = [f"⭐ *Избранные насекомые* ({len(favs)}):\n"]
+    lines = [f"⭐ *Избранные виды* ({len(favs)}):\n"]
     for i, f in enumerate(favs[:20], 1):
         name = f.get("taxon_common_name") or f.get("taxon_name", "—")
         latin = f.get("taxon_name", "")
@@ -130,7 +180,9 @@ async def cmd_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args) if context.args else ""
     if not query:
-        await update.message.reply_text("Используй: /search [название]\nПример: /search Apis mellifera")
+        await update.message.reply_text(
+            "Используй: /search [название]\nПример: /search Apis mellifera"
+        )
         return
 
     from utils.inat import search_taxa
@@ -152,8 +204,11 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             line += f"\n  [Wikipedia]({wiki})"
         lines.append(line)
 
-    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                                    disable_web_page_preview=True)
+    await update.message.reply_text(
+        "\n\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
 
 
 # ── Photo handler ─────────────────────────────────────────────
@@ -164,10 +219,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Ensure user exists
     db.upsert_user(user.id, user.username, user.first_name, user.last_name)
 
+    # Global bot_active check
+    if not is_bot_active():
+        await update.message.reply_text(
+            "🔧 Бот временно на техническом обслуживании. Попробуй позже."
+        )
+        return
+
     # Ban check
     if db.is_banned(user.id):
         await update.message.reply_text("🚫 Ваш аккаунт заблокирован.")
         return
+
+    # Антифлуд
+    if not is_admin(user.id):
+        allowed_flood, remaining = check_flood(user.id)
+        if not allowed_flood:
+            await update.message.reply_text(
+                f"⏱ Подожди {remaining} сек. перед следующим запросом."
+            )
+            return
 
     # Daily limit check
     allowed, used, limit = db.check_and_increment_daily(user.id)
@@ -209,34 +280,56 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         if groq_text is None:
-            await thinking_msg.edit_text("❌ Не удалось получить ответ от AI. Попробуй ещё раз.")
-            db.log_request(user.id, None, None, None, None, None,
-                           size_before, size_after, elapsed_ms,
-                           success=False, error_text="Groq returned None")
+            await thinking_msg.edit_text(
+                "❌ Не удалось получить ответ от AI. Попробуй ещё раз."
+            )
+            db.log_request(
+                user.id, None, None, None, None, None,
+                size_before, size_after, elapsed_ms,
+                success=False, error_text="Groq returned None",
+            )
             return
 
-        # Build response
+        # ── Формируем заголовок ───────────────────────────────
+        alternatives_text = ""
+
         if inat_result:
             score_pct = int(inat_result["score"] * 100)
+            display_name = inat_result.get("taxon_common_name") or inat_result["taxon_name"]
             header = (
-                f"🦋 *{inat_result.get('taxon_common_name') or inat_result['taxon_name']}*\n"
+                f"🌿 *{display_name}*\n"
                 f"_({inat_result['taxon_name']})_\n"
-                f"Уверенность: {score_pct}%\n\n"
+                f"Уверенность iNaturalist: {score_pct}%\n\n"
+            )
+            # Показываем альтернативы если уверенность невысокая
+            if inat_result["score"] < ALTERNATIVES_THRESHOLD:
+                alternatives_text = build_alternatives_text(inat_result)
+
+        elif inat_response is None:
+            # iNaturalist был недоступен — Groq работал самостоятельно
+            header = (
+                "🤖 *Распознано нейросетью*\n"
+                "_iNaturalist был недоступен, результат может быть менее точным_\n\n"
             )
         else:
+            # iNaturalist ответил, но уверенность ниже порога
             header = "🔍 *Вид не определён с достаточной уверенностью*\n\n"
 
-        full_text = header + groq_text
+        full_text = header + groq_text + alternatives_text
 
-        # Inline buttons
+        # ── Inline кнопки ─────────────────────────────────────
         buttons = []
         if inat_result:
             if inat_result.get("wikipedia_url"):
-                buttons.append(InlineKeyboardButton("📖 Wikipedia", url=inat_result["wikipedia_url"]))
-            buttons.append(InlineKeyboardButton(
-                "⭐ В избранное",
-                callback_data=f"fav:{inat_result['taxon_name']}:{inat_result.get('taxon_id', '')}"
-            ))
+                buttons.append(
+                    InlineKeyboardButton("📖 Wikipedia", url=inat_result["wikipedia_url"])
+                )
+            buttons.append(
+                InlineKeyboardButton(
+                    "⭐ В избранное",
+                    callback_data=f"fav:{inat_result['taxon_name']}:{inat_result.get('taxon_id', '')}",
+                )
+            )
 
         markup = InlineKeyboardMarkup([buttons]) if buttons else None
 
@@ -263,9 +356,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.exception(f"handle_photo error: {e}")
         await thinking_msg.edit_text("❌ Произошла ошибка. Попробуй ещё раз.")
         elapsed_ms = int((time.time() - start_time) * 1000)
-        db.log_request(user.id, None, None, None, None, None,
-                       size_before, size_after, elapsed_ms,
-                       success=False, error_text=str(e)[:500])
+        db.log_request(
+            user.id, None, None, None, None, None,
+            size_before, size_after, elapsed_ms,
+            success=False, error_text=str(e)[:500],
+        )
+
+
+# ── Unsupported message types ─────────────────────────────────
+
+async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отвечает на стикеры, документы, голосовые и прочее."""
+    await update.message.reply_text(
+        "📷 Отправь фотографию — я определю вид живого организма на ней.\n"
+        "Другие типы файлов не поддерживаются."
+    )
 
 
 # ── Callback: Add to favorites ────────────────────────────────
@@ -286,9 +391,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Ошибка: нет данных о виде", show_alert=True)
             return
 
-        # Get common name from recent request log
-        db_req = db.get_client().table("requests").select("taxon_common_name,taxon_rank").eq(
-            "telegram_id", user.id).eq("taxon_name", taxon_name).order("created_at", desc=True).limit(1).execute()
+        db_req = (
+            db.get_client()
+            .table("requests")
+            .select("taxon_common_name,taxon_rank")
+            .eq("telegram_id", user.id)
+            .eq("taxon_name", taxon_name)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
 
         common = None
         rank = None
@@ -325,7 +437,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif text == "⭐ Избранное":
         await cmd_favorites(update, context)
     elif text == "🔍 Поиск вида":
-        await update.message.reply_text("Используй команду: /search [название]\nПример: /search Apis mellifera")
+        await update.message.reply_text(
+            "Используй команду: /search [название]\nПример: /search Apis mellifera"
+        )
     elif text == "📷 Отправь фото":
         await update.message.reply_text("Отправь мне фотографию — я определю вид 📷")
     elif text == "🛠 Админ-панель" and is_admin(update.effective_user.id):
@@ -336,6 +450,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     else:
         await update.message.reply_text(
-            "Отправь фото насекомого или воспользуйся меню 👇",
-            reply_markup=admin_keyboard() if is_admin(update.effective_user.id) else main_menu_keyboard(),
+            "Отправь фото или воспользуйся меню 👇",
+            reply_markup=(
+                admin_keyboard() if is_admin(update.effective_user.id)
+                else main_menu_keyboard()
+            ),
         )
