@@ -265,9 +265,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     size_before = size_after = 0
 
     try:
-        # Download photo (best quality)
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
+        # Download photo — поддерживаем оба способа отправки:
+        # 1. Обычное фото (сжатое Telegram'ом)
+        # 2. Документ-изображение (отправлено как файл)
+        if message.photo:
+            file_id = message.photo[-1].file_id
+        elif message.document and message.document.mime_type and \
+                message.document.mime_type.startswith("image/"):
+            file_id = message.document.file_id
+        else:
+            await thinking_msg.edit_text("📷 Отправь изображение — фото или файл формата JPG/PNG.")
+            return
+
+        file = await context.bot.get_file(file_id)
         buf = BytesIO()
         await file.download_to_memory(buf)
         image_bytes = buf.getvalue()
