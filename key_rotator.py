@@ -7,8 +7,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -94,4 +93,5 @@ class KeyRotator:
                     "use_count": e.use_count,
                 }
                 for e in self._entries
-            ]
+                ]
+            
