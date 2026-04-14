@@ -215,6 +215,14 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    message = update.message
+
+    # В группах реагируем только на фото с тегом #определи
+    # В личке бот отвечает на любое фото
+    if message.chat.type in ("group", "supergroup"):
+        caption = (message.caption or "").lower()
+        if "#определи" not in caption:
+            return
 
     # Ensure user exists
     db.upsert_user(user.id, user.username, user.first_name, user.last_name)
