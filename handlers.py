@@ -12,9 +12,9 @@ from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
 import utils.db as db
-from utils.image import resize_to_limit
+from utils.image import resize_to_limit, extract_location
 from utils.inat import score_image, parse_top_result
-from utils.groq_client import describe_insect
+from utils.groq_client import describe_organism
 from config import ADMIN_IDS, SCORE_THRESHOLD
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        ["📷 Отправь фото насекомого"],
+        ["📷 Отправь фото"],
         ["🔍 Поиск вида", "⭐ Избранное"],
         ["📊 Моя статистика", "ℹ️ Помощь"],
     ]
@@ -33,7 +33,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        ["📷 Отправь фото насекомого"],
+        ["📷 Отправь фото"],
         ["🔍 Поиск вида", "⭐ Избранное"],
         ["📊 Моя статистика", "ℹ️ Помощь"],
         ["🛠 Админ-панель"],
@@ -61,7 +61,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = admin_keyboard() if is_admin(user.id) else main_menu_keyboard()
     await update.message.reply_text(
         f"Привет, {user.first_name}! 👋\n\n"
-        "Я помогу определить насекомое по фотографии.\n\n"
+        "Я помогу определить живой организм по фотографии — "
+        "насекомое, растение, гриб, птицу, паука и многое другое.\n\n"
         "📷 Просто отправь фото — и я расскажу, что это за вид, "
         "чем питается, опасен ли и много интересного.\n\n"
         "Используй кнопки меню ниже 👇",
@@ -71,7 +72,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "🦋 *Insect ID Bot — помощь*\n\n"
+        "🌿 *Nature ID Bot — помощь*\n\n"
         "*Основные команды:*\n"
         "/start — перезапустить бота\n"
         "/help — эта справка\n"
@@ -79,7 +80,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/favorites — моё избранное\n"
         "/stats — моя статистика\n\n"
         "*Как пользоваться:*\n"
-        "Отправь фото насекомого — бот определит вид и расскажет о нём подробно.\n\n"
+        "Отправь фото живого организма — насекомого, растения, гриба, птицы, паука — бот определит вид и расскажет о нём подробно.\n\n"
         "*Лимиты:*\n"
         "До 20 запросов в сутки (сбрасывается в полночь UTC).\n\n"
         "Если есть вопросы — свяжись с администратором."
@@ -191,6 +192,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await file.download_to_memory(buf)
         image_bytes = buf.getvalue()
 
+        # Extract EXIF location before resize (resize strips EXIF)
+        location = extract_location(image_bytes)
+
         # Resize
         image_bytes, size_before, size_after = resize_to_limit(image_bytes)
 
@@ -200,7 +204,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         inat_result = parse_top_result(inat_response, threshold) if inat_response else None
 
         # Groq Vision
-        groq_text = describe_insect(image_bytes, inat_result)
+        groq_text = describe_organism(image_bytes, inat_result, location)
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -322,8 +326,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await cmd_favorites(update, context)
     elif text == "🔍 Поиск вида":
         await update.message.reply_text("Используй команду: /search [название]\nПример: /search Apis mellifera")
-    elif text == "📷 Отправь фото насекомого":
-        await update.message.reply_text("Отправь мне фотографию насекомого — я определю вид 📷")
+    elif text == "📷 Отправь фото":
+        await update.message.reply_text("Отправь мне фотографию — я определю вид 📷")
     elif text == "🛠 Админ-панель" and is_admin(update.effective_user.id):
         from config import PORT
         await update.message.reply_text(
