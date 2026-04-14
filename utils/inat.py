@@ -3,13 +3,17 @@ iNaturalist API wrapper.
 Handles CV scoring, taxa search, observations.
 
 Authentication flow:
-  - OAuth token (долгоживущий) → хранится в INAT_API_KEY env
-  - JWT (живёт 24 часа)        → получается автоматически и обновляется
-  - Fallback: если токен не задан, GET-запросы работают публично
-    (CV endpoint требует JWT)
+  Режим 1 — JWT напрямую (текущий):
+    INAT_API_KEY содержит JWT (eyJ...) — используется напрямую.
+    JWT живёт 24 часа. Бот логирует предупреждение за час до истечения.
+    Обновление — вручную: зайти на inaturalist.org/users/api_token
+    и обновить переменную на Render.com.
 
-Key rotation: при 429 автоматически переключаемся на следующий OAuth токен
-и получаем для него новый JWT.
+  Режим 2 — OAuth токен (когда будет доступен):
+    INAT_API_KEY содержит OAuth токен — JWT получается и обновляется
+    автоматически каждые 23 часа.
+
+Key rotation: при 429 переключаемся на следующий ключ.
 """
 
 from __future__ import annotations
@@ -29,30 +33,74 @@ logger = logging.getLogger(__name__)
 
 TIMEOUT = 20.0
 APP_NAME = "InsectIDBot"
-CONTACT  = "github.com/insectidbot"   # замени на свой username iNat или URL
+CONTACT  = "github.com/insectidbot"
 
 USER_AGENT = f"{APP_NAME}/1.0 ({CONTACT})"
 
 JWT_TOKEN_URL = "https://www.inaturalist.org/users/api_token"
-JWT_LIFETIME  = 23 * 3600   # обновляем за час до истечения (iNat даёт 24ч)
+JWT_LIFETIME  = 23 * 3600
+
+
+def _is_jwt(token: str) -> bool:
+    """JWT выглядит как три base64-блока разделённых точками: eyJ..."""
+    parts = token.split(".")
+    return len(parts) == 3 and token.startswith("eyJ")
+
 
 # ── JWT кеш ───────────────────────────────────────────────────
 
 class _JWTCache:
-    """Хранит JWT для каждого OAuth-токена и автообновляет по истечении."""
+    """
+    Хранит JWT для каждого ключа.
+    Если ключ уже является JWT — использует его напрямую.
+    Если ключ является OAuth токеном — обменивает на JWT автоматически.
+    """
 
     def __init__(self):
         self._lock   = threading.Lock()
-        self._tokens: dict[str, tuple[str, float]] = {}  # oauth_key → (jwt, expires_at)
+        self._tokens: dict[str, tuple[str, float]] = {}
 
-    def get(self, oauth_key: str) -> str | None:
+    def get(self, key: str) -> str | None:
+        # Если сам ключ — JWT, используем напрямую
+        if _is_jwt(key):
+            return self._use_jwt_directly(key)
+
+        # Иначе — OAuth токен, получаем JWT через API
         with self._lock:
-            entry = self._tokens.get(oauth_key)
+            entry = self._tokens.get(key)
             if entry and time.time() < entry[1]:
                 return entry[0]
-        return self._refresh(oauth_key)
+        return self._refresh_via_oauth(key)
 
-    def _refresh(self, oauth_key: str) -> str | None:
+    def _use_jwt_directly(self, jwt: str) -> str:
+        """Используем JWT напрямую, логируем время до истечения."""
+        with self._lock:
+            entry = self._tokens.get(jwt)
+            if entry:
+                remaining = entry[1] - time.time()
+                if remaining > 0:
+                    if remaining < 3600:
+                        logger.warning(
+                            f"iNat JWT истекает менее чем через час! "
+                            f"Обнови INAT_API_KEY на Render.com: "
+                            f"зайди на inaturalist.org/users/api_token"
+                        )
+                    return jwt
+                else:
+                    logger.error(
+                        "iNat JWT истёк! Зайди на inaturalist.org/users/api_token, "
+                        "скопируй новый токен и обнови INAT_API_KEY на Render.com."
+                    )
+                    return jwt  # возвращаем всё равно — API сам вернёт 401
+
+            # Первый раз — сохраняем с временем жизни 23 часа от сейчас
+            expires_at = time.time() + JWT_LIFETIME
+            self._tokens[jwt] = (jwt, expires_at)
+            logger.info("iNat: JWT используется напрямую (срок ~23ч с момента запуска)")
+            return jwt
+
+    def _refresh_via_oauth(self, oauth_key: str) -> str | None:
+        """Получаем JWT через OAuth токен."""
         try:
             resp = httpx.get(
                 JWT_TOKEN_URL,
@@ -69,15 +117,25 @@ class _JWTCache:
                 return None
             with self._lock:
                 self._tokens[oauth_key] = (jwt, time.time() + JWT_LIFETIME)
-            logger.info(f"iNat JWT refreshed for key ...{oauth_key[-6:]}")
+            logger.info(f"iNat JWT refreshed via OAuth for key ...{oauth_key[-6:]}")
             return jwt
         except Exception as e:
             logger.error(f"iNat JWT refresh failed: {e}")
             return None
 
-    def invalidate(self, oauth_key: str) -> None:
+    def invalidate(self, key: str) -> None:
         with self._lock:
-            self._tokens.pop(oauth_key, None)
+            self._tokens.pop(key, None)
+
+    def info(self, key: str) -> str:
+        with self._lock:
+            entry = self._tokens.get(key)
+        if not entry:
+            return "не инициализирован"
+        remaining = max(0, int(entry[1] - time.time()))
+        if remaining == 0:
+            return "⚠️ истёк"
+        return f"{remaining // 3600}h {(remaining % 3600) // 60}m"
 
     def info(self, oauth_key: str) -> str:
         with self._lock:
