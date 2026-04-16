@@ -181,14 +181,28 @@ def score_image(image_bytes: bytes) -> dict | None:
     """
     for _ in range(len(INAT_API_KEYS) + 1):
         oauth_key = _rotator.get()
-        headers = _auth_headers(oauth_key)
         try:
+            # CV-эндпоинт пробуем без авторизации — он публичный
+            # JWT используется только для приватных данных
+            logger.info("iNat CV: отправляю запрос (без авторизации)")
             resp = httpx.post(
                 INAT_CV_URL,
-                headers=headers,
+                headers={"User-Agent": USER_AGENT},
                 files={"image": ("photo.jpg", image_bytes, "image/jpeg")},
                 timeout=TIMEOUT,
             )
+            logger.info(f"iNat CV: ответ {resp.status_code}, размер {len(resp.content)} байт")
+            if resp.status_code == 401:
+                # Всё-таки нужна авторизация — пробуем с JWT
+                logger.info("iNat CV: 401 без авторизации, пробую с JWT")
+                headers = _auth_headers(oauth_key)
+                resp = httpx.post(
+                    INAT_CV_URL,
+                    headers=headers,
+                    files={"image": ("photo.jpg", image_bytes, "image/jpeg")},
+                    timeout=TIMEOUT,
+                )
+                logger.info(f"iNat CV: ответ с JWT {resp.status_code}")
             if resp.status_code == 429:
                 logger.warning("iNaturalist CV 429 — rotating key")
                 _handle_rate_limit(oauth_key)
@@ -217,9 +231,11 @@ def parse_top_result(response: dict, threshold: float = 0.40) -> dict | None:
     """
     results = response.get("results", [])
     if not results:
+        logger.warning("iNat CV: пустой список results в ответе")
         return None
     top   = results[0]
     score = top.get("score", 0)
+    logger.info(f"iNat CV: топ результат — {top.get('taxon', {}).get('name')} score={score:.3f} (порог={threshold})")
     if score < threshold:
         return None
     taxon = top.get("taxon", {})
